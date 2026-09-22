@@ -34,7 +34,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -109,13 +109,19 @@ def open_db(path=None):
     c = sqlite3.connect(str(path or DATA / 'history-v1.db'), timeout=30)
     c.execute('PRAGMA journal_mode=WAL')
     c.executescript('''
-        CREATE TABLE IF NOT EXISTS clients(ip TEXT PRIMARY KEY, country TEXT DEFAULT '', city TEXT DEFAULT '', last_seen REAL NOT NULL, geo_due REAL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS clients(ip TEXT PRIMARY KEY, country TEXT DEFAULT '', city TEXT DEFAULT '', isp TEXT DEFAULT '', last_seen REAL NOT NULL, geo_due REAL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS traffic(ts REAL NOT NULL, ip TEXT NOT NULL, bytes INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS traffic_ip_ts ON traffic(ip,ts);
         CREATE INDEX IF NOT EXISTS traffic_ts ON traffic(ts);
         CREATE TABLE IF NOT EXISTS counters(name TEXT, ip TEXT, bytes INTEGER NOT NULL, PRIMARY KEY(name,ip));
         CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);
     ''')
+    cols = [row[1] for row in c.execute('PRAGMA table_info(clients)')]
+    if 'isp' not in cols:
+        c.execute("ALTER TABLE clients ADD COLUMN isp TEXT DEFAULT ''")
+        # Re-resolve existing rows once so they gain an ISP label.
+        c.execute("UPDATE clients SET geo_due=0 WHERE country<>''")
+        c.commit()
     return c
 
 
@@ -141,15 +147,31 @@ def save_sample(c, current, now, reset=False):
 
 
 def geo_lookup(ip):
-    url = 'https://ipwho.is/' + urllib.parse.quote(ip, safe=':') + '?fields=success,country_code,city&lang=zh-CN'
+    url = 'https://ipwho.is/' + urllib.parse.quote(ip, safe=':') + '?fields=success,country_code,city,connection.isp&lang=zh-CN'
     req = urllib.request.Request(url, headers={'User-Agent':'liuliang/' + VERSION})
     with urllib.request.urlopen(req, timeout=3) as response:
         data = json.load(response)
     if not data.get('success'):
-        raise ValueError('城市查询暂不可用')
+        raise ValueError('归属地查询暂不可用')
     # Never render terminal control sequences supplied by an external service.
     clean = lambda s: ''.join(ch for ch in str(s or '') if ch.isprintable())[:60]
-    return clean(data.get('country_code')), clean(data.get('city'))
+    connection = data.get('connection') or {}
+    return clean(data.get('country_code')), clean(data.get('city')), clean(connection.get('isp'))
+
+
+def isp_display(raw):
+    """Short carrier label: Chinese carriers in Chinese, others as returned."""
+    s = ''.join(ch for ch in str(raw or '') if ch.isprintable()).strip()
+    low = s.lower()
+    if 'china mobile' in low:
+        return '中国移动'
+    if 'china telecom' in low:
+        return '中国电信'
+    if 'china unicom' in low or 'china united network' in low:
+        return '中国联通'
+    if not s:
+        return '未解析'
+    return s[:18]
 
 
 def collect(config):
@@ -168,8 +190,8 @@ def collect(config):
             if config['geo']:
                 for ip, in c.execute('SELECT ip FROM clients WHERE geo_due<=? ORDER BY last_seen DESC LIMIT 10', (now,)).fetchall():
                     try:
-                        country, city = geo_lookup(ip)
-                        c.execute('UPDATE clients SET country=?,city=?,geo_due=? WHERE ip=?', (country,city,now+30*86400,ip))
+                        country, city, isp = geo_lookup(ip)
+                        c.execute('UPDATE clients SET country=?,city=?,isp=?,geo_due=? WHERE ip=?', (country,city,isp,now+30*86400,ip))
                     except Exception:
                         c.execute('UPDATE clients SET geo_due=? WHERE ip=?', (now+86400,ip))
                     c.commit()
@@ -245,12 +267,12 @@ def install(args):
     if args.geo:
         geo = args.geo == 'yes'
     else:
-        answer = prompt('城市查询会向 ipwho.is 发送客户端 IP，是否开启？[y/N]：')
+        answer = prompt('城市查询会向 ipwho.is 发送客户端 IP，是否开启？[Y/n]：')
         if answer is None:
-            geo = False
-            print('非交互安装：城市查询默认关闭（加 --geo yes 可开启）')
+            geo = True
+            print('非交互安装：城市查询默认开启（加 --geo no 可关闭）')
         else:
-            geo = answer.lower() in ('y', 'yes')
+            geo = answer.lower() not in ('n', 'no')
     existing = subprocess.run(['nft','list','table','inet',TABLE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if existing.returncode == 0:
         raise RuntimeError('同名 nftables 表已存在，停止安装以免冲突')
@@ -352,21 +374,24 @@ def report(config):
  now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天连接',B,C))
  if not os.path.exists(DB):print('(暂无流量数据库记录)');return
  c=sqlite3.connect(DB); rows=[]
- for ip,co,ci,ls in c.execute('select ip,country,city,last_seen from clients where last_seen>=? order by last_seen desc',(now-604800,)):
-  d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now);age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or '未解析';rows.append((ip,place,d,w,ls,age))
- h=['IP','城市','近24小时','近7天','最近连接'];N=[15,8,10,10,19]
- for ip,pl,d,w,ls,age in rows:N=[max(N[i],ww(x)) for i,x in enumerate([ip,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')])]
+ cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
+ sel='ip,country,city,isp,last_seen' if 'isp' in cols else 'ip,country,city,last_seen'
+ for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc',(now-604800,)):
+  ip,co,ci=rec[0],rec[1],rec[2]; isp,ls=(rec[3],rec[4]) if len(rec)==5 else ('',rec[3])
+  d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now);age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or '未解析';rows.append((ip,isp_display(isp),place,d,w,ls,age))
+ h=['IP','运营商','城市','近24小时','近7天','最近连接'];N=[15,10,8,10,10,19]
+ for ip,net,pl,d,w,ls,age in rows:N=[max(N[i],ww(x)) for i,x in enumerate([ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')])]
  def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
  print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
- for ip,pl,d,w,ls,age in rows:
-  v=[ip,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')];out=[]
+ for ip,net,pl,d,w,ls,age in rows:
+  v=[ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')];out=[]
   for i,x in enumerate(v):
    st=[D,X] if d<=0 and w<=0 else ([B,G] if i==0 and d>0 else [])
-   if i==2 and d>=100*1024**2 or i==3 and w>=1024**3:st=[B,Y]
-   if i==4:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
+   if i==3 and d>=100*1024**2 or i==4 and w>=1024**3:st=[B,Y]
+   if i==5:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
    out.append(col(cell(x,N[i]),*st))
   print('│ '+' │ '.join(out)+' │')
- print(line('└','┴','┘'));a=sum(1 for r in rows if r[2]>0 or r[3]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(rows),a,sz(sum(r[2] for r in rows)),sz(sum(r[3] for r in rows))))
+ print(line('└','┴','┘'));a=sum(1 for r in rows if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(rows),a,sz(sum(r[3] for r in rows)),sz(sum(r[4] for r in rows))))
  c.close()
 
 
