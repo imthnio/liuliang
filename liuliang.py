@@ -16,7 +16,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -158,6 +158,12 @@ def collect(config):
 
 
 def prompt(message):
+    """Read one line from the controlling terminal.
+
+    Returns None when there is no controlling terminal (e.g. installed via
+    `wget ... | sh` from a session without a TTY), so callers can fall back
+    to auto-detected defaults instead of aborting.
+    """
     try:
         with open('/dev/tty', 'r+') as tty:
             tty.write(message); tty.flush()
@@ -165,8 +171,8 @@ def prompt(message):
             if not value:
                 raise RuntimeError('无法读取输入，请使用 --ports 和 --geo 参数')
             return value.strip()
-    except OSError as exc:
-        raise RuntimeError('非交互安装请指定 --ports 和 --geo') from exc
+    except OSError:
+        return None
 
 
 def listening_candidates():
@@ -208,8 +214,25 @@ def install(args):
         default = ','.join(map(str, candidates))
         print('检测到的代理端口：' + (default or '未识别，请填实际监听端口'))
         print('统计本机进程监听的端口；NAT VPS 填内部监听端口。多个端口以逗号分隔。')
-        selected = ports(prompt('统计端口' + (f' [{default}]' if default else '') + '：') or default)
-    geo = args.geo == 'yes' if args.geo else prompt('城市查询会向 ipwho.is 发送客户端 IP，是否开启？[y/N]：').lower() in ('y','yes')
+        answer = prompt('统计端口' + (f' [{default}]' if default else '') + '：')
+        if answer is None:
+            # No controlling terminal (e.g. `wget ... | sh` without a TTY):
+            # use auto-detected ports instead of aborting.
+            if not default:
+                raise RuntimeError('未检测到代理监听端口，非交互安装请用 --ports 指定，例如：wget -qO- <install.sh> | sh -s -- --ports 443,8443')
+            selected = ports(default)
+            print('非交互安装：使用检测到的端口 ' + default)
+        else:
+            selected = ports(answer or default)
+    if args.geo:
+        geo = args.geo == 'yes'
+    else:
+        answer = prompt('城市查询会向 ipwho.is 发送客户端 IP，是否开启？[y/N]：')
+        if answer is None:
+            geo = False
+            print('非交互安装：城市查询默认关闭（加 --geo yes 可开启）')
+        else:
+            geo = answer.lower() in ('y', 'yes')
     existing = subprocess.run(['nft','list','table','inet',TABLE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if existing.returncode == 0:
         raise RuntimeError('同名 nftables 表已存在，停止安装以免冲突')
