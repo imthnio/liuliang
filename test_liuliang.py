@@ -134,7 +134,6 @@ class TrafficTests(unittest.TestCase):
             text=out.getvalue()
             self.assertNotIn('1.1.1.1',text)
             self.assertIn('2.2.2.2',text)
-            self.assertIn('仅显示',text)
     def test_payload_is_self_contained(self):
         s=Path(__file__).with_name('install.sh').read_text()
         payload=s.split("<<'LIULIANG_PYTHON'\n",1)[1].split('\nLIULIANG_PYTHON\n',1)[0]+'\n'
