@@ -16,7 +16,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -169,14 +169,23 @@ def collect(config):
             save_sample(c, current, now, recreated or not last_boot or last_boot[0] != boot)
             c.execute("INSERT OR REPLACE INTO metadata VALUES('boot',?)", (boot,))
             c.commit()
-            if config['geo']:
-                for ip, in c.execute('SELECT ip FROM clients WHERE geo_due<=? ORDER BY last_seen DESC LIMIT 10', (now,)).fetchall():
-                    try:
-                        country, city, isp = geo_lookup(ip)
-                        c.execute('UPDATE clients SET country=?,city=?,isp=?,geo_due=? WHERE ip=?', (country,city,isp,now+30*86400,ip))
-                    except Exception:
-                        c.execute('UPDATE clients SET geo_due=? WHERE ip=?', (now+86400,ip))
-                    c.commit()
+    # Geo lookups run outside the lock: each one is a network round trip
+    # (up to 10 per cycle), and holding the lock that long would stall any
+    # concurrent `liuliang --once`. The DB itself is safe via WAL + busy timeout.
+    if config['geo']:
+        geo_resolve()
+
+
+def geo_resolve():
+    now = time.time()
+    with open_db() as c:
+        for ip, in c.execute('SELECT ip FROM clients WHERE geo_due<=? ORDER BY last_seen DESC LIMIT 10', (now,)).fetchall():
+            try:
+                country, city, isp = geo_lookup(ip)
+                c.execute('UPDATE clients SET country=?,city=?,isp=?,geo_due=? WHERE ip=?', (country,city,isp,now+30*86400,ip))
+            except Exception:
+                c.execute('UPDATE clients SET geo_due=? WHERE ip=?', (now+86400,ip))
+            c.commit()
 
 
 def prompt(message):
