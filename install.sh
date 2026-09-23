@@ -64,7 +64,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.7'
+VERSION = '1.0.8'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -437,7 +437,7 @@ def diff(c,ip,a,b):
  return c.execute('select coalesce(sum(bytes),0) from traffic where ip=? and ts>? and ts<=?',(ip,a,b)).fetchone()[0]
 def report(config):
  DB=str(DATA / "history-v1.db")
- now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天连接（仅显示≥800KB）',B,C))
+ now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天连接',B,C))
  if not os.path.exists(DB):print('(暂无流量数据库记录)');return
  c=sqlite3.connect(DB); rows=[]
  cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
