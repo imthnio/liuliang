@@ -49,7 +49,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.4'
+VERSION = '1.0.5'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -243,25 +243,16 @@ def geo_resolve():
             c.commit()
 
 
-def prompt(message):
-    """Read one line from the controlling terminal.
+PROXY_PROCESS = re.compile(r'(xray|v2ray|sing-box|hysteria|tuic|shadowsocks|ss-server|trojan|anytls)', re.I)
 
-    Returns None when there is no controlling terminal (e.g. installed via
-    `wget ... | sh` from a session without a TTY), so callers can fall back
-    to auto-detected defaults instead of aborting.
+def listening_ports(proxy_only=True):
+    """Return sorted listening TCP ports on this machine.
+
+    proxy_only=True: only ports whose process name looks like a proxy/tunnel
+    server (xray, sing-box, hysteria, tuic, trojan, ...).
+    proxy_only=False: every listening TCP port (fallback when no proxy
+    process is recognized).
     """
-    try:
-        with open('/dev/tty', 'r+') as tty:
-            tty.write(message); tty.flush()
-            value = tty.readline()
-            if not value:
-                raise RuntimeError('无法读取输入，请使用 --ports 和 --geo 参数')
-            return value.strip()
-    except OSError:
-        return None
-
-
-def listening_candidates():
     cmd = ['ss','-H','-lntup'] if shutil.which('ss') else ['netstat','-lntup']
     try:
         text = run(cmd, capture_output=True).stdout
@@ -269,7 +260,7 @@ def listening_candidates():
         return []
     found = set()
     for line in text.splitlines():
-        if not re.search(r'(xray|sing-box|hysteria|tuic|ss-server)', line, re.I):
+        if proxy_only and not PROXY_PROCESS.search(line):
             continue
         words = line.split()
         # ss: netid state recv-q send-q local peer; netstat: proto recv-q send-q local peer
@@ -295,30 +286,22 @@ def install(args):
         raise RuntimeError('需要正在使用 systemd 或 OpenRC 的 Linux VPS')
     if args.ports:
         selected = ports(args.ports)
+        print('使用手动指定的端口：' + ','.join(map(str, selected)))
     else:
-        candidates = listening_candidates()
-        default = ','.join(map(str, candidates))
-        print('检测到的代理端口：' + (default or '未识别，请填实际监听端口'))
-        print('统计本机进程监听的端口；NAT VPS 填内部监听端口。多个端口以逗号分隔。')
-        answer = prompt('统计端口' + (f' [{default}]' if default else '') + '：')
-        if answer is None:
-            # No controlling terminal (e.g. `wget ... | sh` without a TTY):
-            # use auto-detected ports instead of aborting.
-            if not default:
-                raise RuntimeError('未检测到代理监听端口，非交互安装请用 --ports 指定，例如：wget -qO- <install.sh> | sh -s -- --ports 443,8443')
-            selected = ports(default)
-            print('非交互安装：使用检测到的端口 ' + default)
+        # 全自动：先按代理进程名识别，识别不到就退到本机全部监听端口（不含 SSH 22）。
+        # 全程不提问，小白直接回车粘贴一行命令即可。
+        candidates = listening_ports(proxy_only=True)
+        if candidates:
+            selected = candidates
+            print('自动检测到代理端口：' + ','.join(map(str, selected)) + '（NAT VPS 取内部监听端口）')
         else:
-            selected = ports(answer or default)
-    if args.geo:
-        geo = args.geo == 'yes'
-    else:
-        answer = prompt('城市查询会向 ipwho.is 发送客户端 IP，是否开启？[Y/n]：')
-        if answer is None:
-            geo = True
-            print('非交互安装：城市查询默认开启（加 --geo no 可关闭）')
-        else:
-            geo = answer.lower() not in ('n', 'no')
+            everything = [p for p in listening_ports(proxy_only=False) if p != 22]
+            if not everything:
+                raise RuntimeError('未检测到任何监听端口：请先把节点装好，再重跑一键安装')
+            selected = everything
+            print('未识别出代理进程，已自动选用本机全部监听端口：' + ','.join(map(str, selected)) + '（不含 SSH 22）')
+    geo = args.geo != 'no'
+    print('城市查询：默认开启（向 ipwho.is 发送客户端 IP；归属地是估计值，仅供参考）')
     existing = subprocess.run(['nft','list','table','inet',TABLE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if existing.returncode == 0:
         raise RuntimeError('同名 nftables 表已存在，停止安装以免冲突')
@@ -380,8 +363,8 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
 def main():
     parser = argparse.ArgumentParser(description='按 IP 查看近24小时和近7天端口流量')
     parser.add_argument('--install', action='store_true')
-    parser.add_argument('--ports', help='安装时指定端口，如 443,8443')
-    parser.add_argument('--geo', choices=['yes','no'], help='安装时选择是否向 ipwho.is 查询客户端 IP')
+    parser.add_argument('--ports', help='高级：手动指定统计端口，如 443,8443（默认自动检测）')
+    parser.add_argument('--geo', choices=['yes','no'], help='高级：--geo no 关闭城市查询（默认开启）')
     parser.add_argument('--daemon', action='store_true')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--version', action='version', version=VERSION)
