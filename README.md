@@ -5,14 +5,10 @@
 ## 安装（root，一行）
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/imthnio/vps-lianjie-ip/main/install.sh | sh
+sh -c 'c(){ command -v "$1" >/dev/null 2>&1; }; c curl || c wget || { for pm in "apk add --no-cache" "apt-get install -y" "yum install -y" "dnf install -y"; do b=${pm%% *}; c $b || continue; [ $b = apt-get ] && { apt-get update -qq 2>/dev/null || sudo apt-get update -qq 2>/dev/null; }; $pm curl wget ca-certificates 2>/dev/null || sudo $pm curl wget ca-certificates 2>/dev/null; break; done; c curl || c wget || { echo "装不上 curl / wget，请手动装一个"; exit 1; }; }; ok=""; for u in https://raw.githubusercontent.com/imthnio/vps-lianjie-ip/main/install.sh https://cdn.jsdelivr.net/gh/imthnio/vps-lianjie-ip@main/install.sh; do (wget -qO /tmp/liuliang-install.sh "$u" || curl -fsSL -o /tmp/liuliang-install.sh "$u") 2>/dev/null && [ -s /tmp/liuliang-install.sh ] && head -1 /tmp/liuliang-install.sh | grep -q "^#!/bin/sh" && { ok=1; break; }; rm -f /tmp/liuliang-install.sh; done; [ -n "$ok" ] || { echo "下载 install.sh 失败，请检查网络"; exit 1; }; sh /tmp/liuliang-install.sh'
 ```
 
-只有 curl：
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/imthnio/vps-lianjie-ip/main/install.sh | sh
-```
+一行搞定：自动识别 curl / wget，两个都没有就自动装；install.sh 从 GitHub 和 jsdelivr 双镜像下载。
 
 全自动安装，全程无需任何操作：自动检测代理监听端口（NAT VPS 取内部监听端口）；城市查询默认开启（会向 ipwho.is 发送客户端 IP）。
 
