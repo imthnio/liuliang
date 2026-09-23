@@ -5,10 +5,25 @@ if [ -e /etc/liuliang/config.json ] || [ -e /usr/local/bin/liuliang ]; then
   echo "已安装 liuliang，停止覆盖。直接输入 liuliang 查看统计。"; exit 0
 fi
 # Install only standard packages from this machine's configured distribution repositories.
+# apt/dpkg 锁被系统自动更新占住时等待重试（Ubuntu 刚开机常见）；非锁错误直接失败。
+apt_retry() {
+  _ar_rounds=$1; shift
+  _ar_i=0
+  while [ $_ar_i -lt "$_ar_rounds" ]; do
+    if "$@" 2>/tmp/liuliang-apt.log; then return 0; fi
+    grep -qiE 'Could not get lock|Unable to acquire|lock.*frontend|frontend.*lock' /tmp/liuliang-apt.log || return 1
+    _ar_i=$((_ar_i + 1))
+    echo "apt 正被系统更新占用，等待 20 秒后重试（$_ar_i/$_ar_rounds）…"
+    sleep 20
+  done
+  return 1
+}
+apt_update() { apt-get update; }
+apt_install() { DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=120 python3 nftables ca-certificates iproute2; }
 if command -v apk >/dev/null 2>&1; then
   apk add --no-cache python3 nftables ca-certificates iproute2
 elif command -v apt-get >/dev/null 2>&1; then
-  if ! apt-get update 2>/tmp/liuliang-apt.log; then
+  if ! apt_retry 10 apt_update; then
     # Ubuntu EOL: this release no longer has a Release file on the official
     # mirrors. Retry once against old-releases.ubuntu.com.
     if grep -qiE 'no longer has a Release file' /tmp/liuliang-apt.log; then
@@ -18,13 +33,13 @@ elif command -v apt-get >/dev/null 2>&1; then
         [ -e "$f" ] || continue
         sed -i -e 's#https\?://archive\.ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#g' -e 's#https\?://security\.ubuntu\.com/ubuntu#http://old-releases.ubuntu.com/ubuntu#g' "$f"
       done
-      apt-get update
+      apt_retry 10 apt_update || { cat /tmp/liuliang-apt.log >&2; exit 1; }
     else
       cat /tmp/liuliang-apt.log >&2
       exit 1
     fi
   fi
-  DEBIAN_FRONTEND=noninteractive apt-get install -y python3 nftables ca-certificates iproute2
+  apt_retry 3 apt_install || { echo '依赖安装失败，apt 最后输出：' >&2; tail -5 /tmp/liuliang-apt.log >&2; exit 1; }
 else
   echo "目前支持 Alpine、Debian、Ubuntu。" >&2; exit 1
 fi
@@ -49,7 +64,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.5'
+VERSION = '1.0.6'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -99,6 +114,26 @@ def ensure_table():
     return True
 
 
+def parse_duration(value):
+    """把 expires 超时转成秒。
+
+    不同 nft 版本的 -j 输出里，expires 可能是数字（秒），也可能是
+    '7d23h59m' 这样的字符串；两种都转成秒。拿不到有效值时返回 None，
+    调用方回退到采样时刻（精度降级，但不崩）。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value or '').strip()
+    if re.fullmatch(r'[0-9]+', text):
+        return int(text)
+    total = 0
+    for amount, unit in re.findall(r'([0-9]+)\s*([dhms])', text):
+        total += int(amount) * {'d': 86400, 'h': 3600, 'm': 60, 's': 1}[unit]
+    return total or None
+
+
 def parse_counters(document):
     """返回 {(set 名, ip): (累计字节数, expires)}。
 
@@ -114,10 +149,9 @@ def parse_counters(document):
                 try:
                     ip = ipaddress.ip_address(str(value))
                     if ip.is_global:
-                        expires = obj.get('expires')
                         result[(setname, str(ip))] = (
                             int(counter['bytes']),
-                            int(expires) if isinstance(expires, (int, float)) else None,
+                            parse_duration(obj.get('expires')),
                         )
                 except ValueError:
                     pass
