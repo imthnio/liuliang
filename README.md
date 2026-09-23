@@ -10,7 +10,7 @@ sh -c 'c(){ command -v "$1" >/dev/null 2>&1; }; c curl || c wget || { for pm in 
 
 一行搞定：自动识别 curl / wget，两个都没有就自动装；install.sh 从 GitHub 和 jsdelivr 双镜像下载。
 
-全自动安装，全程无需任何操作：自动检测代理监听端口（NAT VPS 取内部监听端口）；城市查询默认开启（会向 ipwho.is 发送客户端 IP）。
+全自动安装，全程无需任何操作：自动检测代理监听端口（NAT VPS 取内部监听端口）。
 
 装好后产生一点流量，约两分钟后运行 `liuliang` 查看。
 
