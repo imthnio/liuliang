@@ -80,6 +80,22 @@ class TrafficTests(unittest.TestCase):
         # 后一轮采样 now 更大，但 expires 算出的时间反而更早：last_seen 不应倒退
         m.save_sample(self.c,{('up4',IP):(200,m.SET_TIMEOUT-5000)},10120)
         self.assertEqual(self.c.execute('select last_seen from clients').fetchone()[0],10000)
+    def test_parse_duration_number_and_string(self):
+        self.assertEqual(m.parse_duration(691200), 691200)
+        self.assertEqual(m.parse_duration(691199.7), 691199)
+        self.assertEqual(m.parse_duration('691200'), 691200)
+        self.assertEqual(m.parse_duration('7d23h59m'), 7*86400+23*3600+59*60)
+        self.assertEqual(m.parse_duration('5m'), 300)
+        self.assertEqual(m.parse_duration('2h'), 7200)
+        self.assertEqual(m.parse_duration('1d'), 86400)
+        self.assertIsNone(m.parse_duration(None))
+        self.assertIsNone(m.parse_duration(''))
+        self.assertIsNone(m.parse_duration('garbage'))
+    def test_parse_counters_accepts_string_expires(self):
+        elem = {'val': IP, 'counter': {'bytes': 100, 'packets': 1}, 'expires': '7d23h59m'}
+        items = [{'set': {'name': 'up4', 'elem': [{'elem': elem}]}}]
+        actual = m.parse_counters({'nftables': items})
+        self.assertEqual(actual, {('up4', IP): (100, 7*86400+23*3600+59*60)})
     def test_set_timeout_matches_rules(self):
         self.assertEqual(m.SET_TIMEOUT,8*86400)
         self.assertIn('timeout 8d',m.rules([443]))
@@ -92,11 +108,11 @@ class TrafficTests(unittest.TestCase):
         output='tcp LISTEN 0 4096 *:443 *:* users:(("xray",pid=8,fd=3))\n'
         with patch.object(m.shutil,'which',return_value='/bin/ss'),patch.object(m,'run') as run:
             run.return_value.stdout=output
-            self.assertEqual(m.listening_candidates(),[443])
+            self.assertEqual(m.listening_ports(),[443])
     def test_detect_netstat_ports(self):
         with patch.object(m.shutil,'which',return_value=None),patch.object(m,'run') as run:
             run.return_value.stdout='tcp 0 0 :::51911 :::* LISTEN 1194/xray\n'
-            self.assertEqual(m.listening_candidates(),[51911])
+            self.assertEqual(m.listening_ports(),[51911])
     def test_report_unicode(self):
         with tempfile.TemporaryDirectory() as temp:
             db=m.open_db(Path(temp)/'history-v1.db')
