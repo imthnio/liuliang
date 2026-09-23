@@ -5,13 +5,13 @@
 ## 安装（root，一行）
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/imthnio/liuliang/main/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/imthnio/vps-lianjie-ip/main/install.sh | sh
 ```
 
 只有 curl：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/imthnio/liuliang/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/imthnio/vps-lianjie-ip/main/install.sh | sh
 ```
 
 全自动安装，全程无需任何操作：自动检测代理监听端口（NAT VPS 取内部监听端口）；城市查询默认开启（会向 ipwho.is 发送客户端 IP）。
