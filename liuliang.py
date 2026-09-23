@@ -16,7 +16,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.5'
+VERSION = '1.0.6'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -66,6 +66,26 @@ def ensure_table():
     return True
 
 
+def parse_duration(value):
+    """把 expires 超时转成秒。
+
+    不同 nft 版本的 -j 输出里，expires 可能是数字（秒），也可能是
+    '7d23h59m' 这样的字符串；两种都转成秒。拿不到有效值时返回 None，
+    调用方回退到采样时刻（精度降级，但不崩）。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value or '').strip()
+    if re.fullmatch(r'[0-9]+', text):
+        return int(text)
+    total = 0
+    for amount, unit in re.findall(r'([0-9]+)\s*([dhms])', text):
+        total += int(amount) * {'d': 86400, 'h': 3600, 'm': 60, 's': 1}[unit]
+    return total or None
+
+
 def parse_counters(document):
     """返回 {(set 名, ip): (累计字节数, expires)}。
 
@@ -81,10 +101,9 @@ def parse_counters(document):
                 try:
                     ip = ipaddress.ip_address(str(value))
                     if ip.is_global:
-                        expires = obj.get('expires')
                         result[(setname, str(ip))] = (
                             int(counter['bytes']),
-                            int(expires) if isinstance(expires, (int, float)) else None,
+                            parse_duration(obj.get('expires')),
                         )
                 except ValueError:
                     pass
