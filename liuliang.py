@@ -16,7 +16,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.6'
+VERSION = '1.0.7'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -26,6 +26,9 @@ INTERVAL = 120
 # 每次有包命中，内核会把该元素的 expires 重置为该值，因此可以用它
 # 反推出"最后一个包"的时间（约 1 秒精度），而不用采样时刻代替。
 SET_TIMEOUT = 8 * 86400
+# 展示过滤阈值：近7天总流量低于该值的 IP 不在表格中显示（也不计入合计）。
+# 用户要求：低于 800KB 的流量不用统计。
+MIN_TRAFFIC_BYTES = 800 * 1024
 
 
 def run(args, **kwargs):
@@ -386,14 +389,18 @@ def diff(c,ip,a,b):
  return c.execute('select coalesce(sum(bytes),0) from traffic where ip=? and ts>? and ts<=?',(ip,a,b)).fetchone()[0]
 def report(config):
  DB=str(DATA / "history-v1.db")
- now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天连接',B,C))
+ now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天连接（仅显示≥800KB）',B,C))
  if not os.path.exists(DB):print('(暂无流量数据库记录)');return
  c=sqlite3.connect(DB); rows=[]
  cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
  sel='ip,country,city,isp,last_seen' if 'isp' in cols else 'ip,country,city,last_seen'
  for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc',(now-604800,)):
   ip,co,ci=rec[0],rec[1],rec[2]; isp,ls=(rec[3],rec[4]) if len(rec)==5 else ('',rec[3])
-  d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now);age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or '未解析';rows.append((ip,isp_display(isp),place,d,w,ls,age))
+  d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now)
+  if w<MIN_TRAFFIC_BYTES: continue
+  age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or '未解析';rows.append((ip,isp_display(isp),place,d,w,ls,age))
+ if not rows:
+  print('(近7天无达到 800KB 的流量记录)');c.close();return
  h=['IP','运营商','城市','近24小时','近7天','最近连接'];N=[15,10,8,10,10,19]
  for ip,net,pl,d,w,ls,age in rows:N=[max(N[i],ww(x)) for i,x in enumerate([ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')])]
  def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
