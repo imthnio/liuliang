@@ -16,12 +16,16 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.3'
+VERSION = '1.0.4'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
 PROGRAM = Path('/usr/local/lib/liuliang/liuliang.py')
 INTERVAL = 120
+# nft set 元素超时秒数，必须与 rules() 里 `timeout 8d` 保持一致。
+# 每次有包命中，内核会把该元素的 expires 重置为该值，因此可以用它
+# 反推出"最后一个包"的时间（约 1 秒精度），而不用采样时刻代替。
+SET_TIMEOUT = 8 * 86400
 
 
 def run(args, **kwargs):
@@ -63,6 +67,11 @@ def ensure_table():
 
 
 def parse_counters(document):
+    """返回 {(set 名, ip): (累计字节数, expires)}。
+
+    expires 是该元素距离超时还剩的秒数（nft -j 输出）；元素每次被包命中
+    都会被重置为 SET_TIMEOUT。若 nft 没给 expires（如旧版本），则为 None。
+    """
     result = {}
     def walk(obj, setname):
         if isinstance(obj, dict):
@@ -72,7 +81,11 @@ def parse_counters(document):
                 try:
                     ip = ipaddress.ip_address(str(value))
                     if ip.is_global:
-                        result[(setname, str(ip))] = int(counter['bytes'])
+                        expires = obj.get('expires')
+                        result[(setname, str(ip))] = (
+                            int(counter['bytes']),
+                            int(expires) if isinstance(expires, (int, float)) else None,
+                        )
                 except ValueError:
                     pass
             for child in obj.values():
@@ -112,17 +125,26 @@ def save_sample(c, current, now, reset=False):
         c.execute('DELETE FROM counters')
     previous = {(name, ip): n for name, ip, n in c.execute('SELECT name,ip,bytes FROM counters')}
     activity = {}
-    for (name, ip), n in current.items():
+    last_seen = {}
+    for (name, ip), (n, expires) in current.items():
         old = previous.get((name, ip), 0)
         delta = n - old if n >= old else n
         if delta > 0:
             activity[ip] = activity.get(ip, 0) + delta
+            if expires is not None:
+                # 该 set 元素在本轮采样内被包命中过：用 expires 反推最后
+                # 一个包的时间（约 1 秒精度），比直接用采样时刻准得多。
+                t = min(max(now - (SET_TIMEOUT - expires), 0), now)
+                if t > last_seen.get(ip, 0):
+                    last_seen[ip] = t
         c.execute('INSERT OR REPLACE INTO counters VALUES(?,?,?)', (name, ip, n))
     for name, ip in previous.keys() - current.keys():
         c.execute('DELETE FROM counters WHERE name=? AND ip=?', (name, ip))
     for ip, n in activity.items():
         c.execute('INSERT INTO traffic VALUES(?,?,?)', (now, ip, n))
-        c.execute('INSERT INTO clients(ip,last_seen) VALUES(?,?) ON CONFLICT(ip) DO UPDATE SET last_seen=excluded.last_seen', (ip, now))
+        # 取四个方向里最晚的那个包的时间；没有 expires 时回退到采样时刻；
+        # max() 保证 last_seen 只增不减，避免时钟抖动造成时间倒退。
+        c.execute('INSERT INTO clients(ip,last_seen) VALUES(?,?) ON CONFLICT(ip) DO UPDATE SET last_seen=max(clients.last_seen, excluded.last_seen)', (ip, last_seen.get(ip, now)))
     c.execute('DELETE FROM traffic WHERE ts<?', (now - 8*86400,))
     c.execute('DELETE FROM clients WHERE last_seen<?', (now - 8*86400,))
     c.commit()
