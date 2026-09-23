@@ -116,11 +116,25 @@ class TrafficTests(unittest.TestCase):
     def test_report_unicode(self):
         with tempfile.TemporaryDirectory() as temp:
             db=m.open_db(Path(temp)/'history-v1.db')
-            m.save_sample(db,{('up6','2606:4700:4700::1111'):(1024, None)},m.time.time())
+            m.save_sample(db,{('up6','2606:4700:4700::1111'):(900*1024, None)},m.time.time())
             db.execute("update clients set city='测试城市',country='US'");db.commit();db.close()
             out=io.StringIO()
             with patch.object(m,'DATA',Path(temp)),contextlib.redirect_stdout(out):m.report({'ports':[443],'geo':True})
-            self.assertIn('测试城市',out.getvalue());self.assertIn('1.0 KB',out.getvalue())
+            self.assertIn('测试城市',out.getvalue());self.assertIn('900',out.getvalue())
+    def test_report_filters_below_800kb(self):
+        with tempfile.TemporaryDirectory() as temp:
+            now=m.time.time()
+            db=m.open_db(Path(temp)/'history-v1.db')
+            # 799KB -> filtered out; 800KB -> kept (boundary inclusive)
+            m.save_sample(db,{('up4','1.1.1.1'):(799*1024, None)},now)
+            m.save_sample(db,{('up4','2.2.2.2'):(800*1024, None)},now)
+            db.close()
+            out=io.StringIO()
+            with patch.object(m,'DATA',Path(temp)),contextlib.redirect_stdout(out):m.report({'ports':[443],'geo':True})
+            text=out.getvalue()
+            self.assertNotIn('1.1.1.1',text)
+            self.assertIn('2.2.2.2',text)
+            self.assertIn('仅显示',text)
     def test_payload_is_self_contained(self):
         s=Path(__file__).with_name('install.sh').read_text()
         payload=s.split("<<'LIULIANG_PYTHON'\n",1)[1].split('\nLIULIANG_PYTHON\n',1)[0]+'\n'
