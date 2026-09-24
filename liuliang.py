@@ -16,7 +16,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.9'
+VERSION = '1.0.10'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -421,61 +421,124 @@ def listening_ports(proxy_only=True):
     return detect_ports(proxy_only)[0]
 
 
+def saved_config():
+    """已安装时读出端口和城市查询开关。读不到就当没装过。"""
+    try:
+        data = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get('ports'):
+        return None
+    return data
+
+
+def resolve_install(existing, args, detected=None):
+    """决定这次安装用哪些端口、是否查城市、是不是在更新。
+
+    更新时保留原来的端口和城市查询开关。只有命令行明确写了 --ports / --geo 才覆盖。
+    流量数据库不在这里处理，调用方不能删它。
+    """
+    updating = existing is not None
+    if args.ports:
+        selected = ports(args.ports)
+    elif updating:
+        selected = ports(','.join(str(port) for port in existing['ports']))
+    elif detected:
+        selected = ports(','.join(str(port) for port in detected))
+    else:
+        raise RuntimeError('未检测到任何监听端口：请先把节点装好，再重跑一键安装')
+    if args.geo is not None:
+        geo = args.geo != 'no'
+    elif updating:
+        geo = bool(existing.get('geo', True))
+    else:
+        geo = True
+    return selected, geo, updating
+
+
+def table_loaded():
+    probe = subprocess.run(['nft', 'list', 'table', 'inet', TABLE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return probe.returncode == 0
+
+
+def stop_service(init):
+    cmd = ['systemctl', 'stop', 'liuliang'] if init == 'systemd' else ['rc-service', 'liuliang', 'stop']
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def apply_nft(text):
+    """写入规则文件。内容和正在用的表一致时不动内核计数器，变了才换表。"""
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.nft') as handle:
+        handle.write(text)
+        handle.flush()
+        run(['nft', '-c', '-f', handle.name], capture_output=True)
+    path = CONFIG.parent / 'counters.nft'
+    previous = path.read_text() if path.exists() else None
+    path.write_text(text)
+    if previous == text and table_loaded():
+        return
+    if table_loaded():
+        run(['nft', 'delete', 'table', 'inet', TABLE])
+    run(['nft', '-f', str(path)], capture_output=True)
+
+
 def install(args):
     if os.geteuid() != 0:
         raise RuntimeError('请使用 root 用户运行安装')
-    managed = [CONFIG, PROGRAM, Path('/usr/local/bin/liuliang'), Path('/etc/init.d/liuliang'), Path('/etc/systemd/system/liuliang.service')]
-    if any(p.exists() for p in managed):
-        raise RuntimeError('已发现 liuliang 文件。为保留已有历史，本安装器不覆盖；已安装的机器直接输入 liuliang。')
     if Path('/run/systemd/system').is_dir():
         init = 'systemd'
     elif Path('/sbin/openrc-run').exists():
         init = 'openrc'
     else:
         raise RuntimeError('需要正在使用 systemd 或 OpenRC 的 Linux VPS')
-    if args.ports:
-        selected = ports(args.ports)
-        print('使用手动指定的端口：' + ','.join(map(str, selected)))
-    else:
+    existing = saved_config()
+    detected, mode = [], None
+    if not args.ports and not (existing and existing.get('ports')):
         # 全自动：代理的真实监听端口优先。UDP 临时端口不算；代理若只绑在回环上，
         # 改统计前面的对外端口。都没有时再用本机对外监听端口（不含 SSH 22）。
-        selected, mode = detect_ports(proxy_only=True)
-        if not selected:
-            selected, mode = detect_ports(proxy_only=False)
-        if not selected:
-            raise RuntimeError('未检测到任何监听端口：请先把节点装好，再重跑一键安装')
-        if len(selected) > 64:
+        detected, mode = detect_ports(proxy_only=True)
+        if not detected:
+            detected, mode = detect_ports(proxy_only=False)
+            mode = 'fallback' if detected else None
+        if len(detected) > 64:
             print('监听端口超过 64 个，只统计其中 64 个。需要取舍时用 --ports 指定。')
-            selected = selected[:64]
-        listed = ','.join(map(str, selected))
-        if mode == 'proxy':
-            print('自动检测到代理端口：' + listed + '（NAT VPS 取内部监听端口）')
-        elif mode == 'frontend':
-            print('代理只监听在回环地址，已改统计对外端口：' + listed + '（常见于前面还有 nginx/caddy）')
-        elif mode == 'loopback':
-            print('只检测到回环地址上的代理端口：' + listed)
-        else:
-            print('未识别出代理进程，已自动选用本机对外监听端口：' + listed + '（不含 SSH 22）')
-    geo = args.geo != 'no'
-    if geo:
-        print('城市查询：已开启（向 ipwho.is 发送客户端 IP；归属地是估计值，仅供参考）')
+            detected = detected[:64]
+    selected, geo, updating = resolve_install(existing, args, detected)
+    listed = ','.join(map(str, selected))
+    if updating and not args.ports:
+        print('已安装 liuliang，更新到 ' + VERSION + '。保留端口 ' + listed + ' 和已有流量。')
+    elif updating:
+        print('已安装 liuliang，更新到 ' + VERSION + '。端口改为 ' + listed + '。已有流量保留。')
+    elif args.ports:
+        print('使用手动指定的端口：' + listed)
+    elif mode == 'proxy':
+        print('自动检测到代理端口：' + listed + '（NAT VPS 取内部监听端口）')
+    elif mode == 'frontend':
+        print('代理只监听在回环地址，已改统计对外端口：' + listed + '（常见于前面还有 nginx/caddy）')
+    elif mode == 'loopback':
+        print('只检测到回环地址上的代理端口：' + listed)
     else:
-        print('城市查询：已关闭')
-    existing = subprocess.run(['nft','list','table','inet',TABLE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if existing.returncode == 0:
-        raise RuntimeError('同名 nftables 表已存在，停止安装以免冲突')
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.nft') as f:
-        f.write(rules(selected)); f.flush()
-        run(['nft','-c','-f',f.name], capture_output=True)
-    # All compatibility checks precede persistent file creation.
+        print('未识别出代理进程，已自动选用本机对外监听端口：' + listed + '（不含 SSH 22）')
+    if not updating or args.geo is not None:
+        if geo:
+            print('城市查询：已开启（向 ipwho.is 发送客户端 IP；归属地是估计值，仅供参考）')
+        else:
+            print('城市查询：已关闭')
+    # 先停采集，再把内核里还没落盘的计数记下来。更新不删除 /var/lib/liuliang。
+    stop_service(init)
+    if updating and table_loaded():
+        try:
+            collect({'ports': selected, 'geo': False})
+        except Exception as exc:
+            print('更新前没能记下最后一次采样，继续更新：' + str(exc), file=sys.stderr)
     config = {'version':VERSION, 'ports':selected, 'geo':geo}
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
         folder.mkdir(parents=True, exist_ok=True)
     DATA.chmod(0o700)
     CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
     CONFIG.chmod(0o600)
-    (CONFIG.parent/'counters.nft').write_text(rules(selected))
+    apply_nft(rules(selected))
     PROGRAM.write_bytes(Path(__file__).read_bytes()); PROGRAM.chmod(0o755)
     wrapper = Path('/usr/local/bin/liuliang')
     wrapper.write_text('#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py "$@"\n'); wrapper.chmod(0o755)
@@ -493,7 +556,8 @@ UMask=0077
 WantedBy=multi-user.target
 ''')
         run(['systemctl','daemon-reload'])
-        run(['systemctl','enable','--now','liuliang'])
+        run(['systemctl','enable','liuliang'])
+        run(['systemctl','restart','liuliang'])
         run(['systemctl','is-active','--quiet','liuliang'])
     else:
         logdir = Path('/var/log/liuliang'); logdir.mkdir(exist_ok=True); logdir.chmod(0o700)
@@ -512,11 +576,12 @@ error_log="/var/log/liuliang/collector.log"
 depend() { need net; after firewall nftables; }
 start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
 '''); service.chmod(0o755)
-        run(['rc-service','liuliang','start'])
+        run(['rc-service','liuliang','restart'])
         run(['rc-update','add','liuliang','default'])
         run(['rc-service','liuliang','status'])
     collect(config)
-    print('\n安装完成。以后输入：liuliang\n端口：'+','.join(map(str,selected))+'；城市查询：'+('已启用' if geo else '关闭'))
+    done = '更新完成' if updating else '安装完成'
+    print('\n'+done+'。以后输入：liuliang\n端口：'+','.join(map(str,selected))+'；城市查询：'+('已启用' if geo else '关闭'))
 
 
 def main():

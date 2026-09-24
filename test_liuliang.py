@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -19,6 +20,20 @@ class TrafficTests(unittest.TestCase):
         self.c.close()
     def amount(self):
         return self.c.execute('select coalesce(sum(bytes),0) from traffic').fetchone()[0]
+    def test_update_keeps_saved_ports_and_geo(self):
+        args = argparse.Namespace(ports=None, geo=None)
+        selected, geo, updating = m.resolve_install({'ports':[443, 8443], 'geo': False}, args)
+        self.assertEqual(selected, [443, 8443])
+        self.assertFalse(geo)
+        self.assertTrue(updating)
+    def test_update_flags_override_saved_config(self):
+        args = argparse.Namespace(ports='2053', geo='yes')
+        selected, geo, updating = m.resolve_install({'ports':[443], 'geo': False}, args)
+        self.assertEqual((selected, geo, updating), ([2053], True, True))
+    def test_fresh_install_uses_detected_ports(self):
+        args = argparse.Namespace(ports=None, geo=None)
+        selected, geo, updating = m.resolve_install(None, args, [8443])
+        self.assertEqual((selected, geo, updating), ([8443], True, False))
     def test_port_validation(self):
         self.assertEqual(m.ports('443,8443,443'), [443,8443])
         for value in ('0','65536','-1','443; reboot','abc','443,',''):
