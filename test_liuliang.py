@@ -40,6 +40,12 @@ class TrafficTests(unittest.TestCase):
         m.save_sample(self.c,{},1120)
         m.save_sample(self.c,{('up4',IP):(20, None)},1240)
         self.assertEqual(self.amount(),120)
+    def test_one_address_expiring_still_resets_its_baseline(self):
+        other='1.1.1.1'
+        m.save_sample(self.c,{('up4',IP):(100, None),('up4',other):(100, None)},1000)
+        m.save_sample(self.c,{('up4',IP):(100, None)},1120)
+        m.save_sample(self.c,{('up4',IP):(100, None),('up4',other):(40, None)},1240)
+        self.assertEqual(self.amount(),240)
     def test_idle_does_not_change_activity(self):
         m.save_sample(self.c,{('up4',IP):(100, None)},1000)
         m.save_sample(self.c,{('up4',IP):(100, None)},1120)
@@ -56,7 +62,7 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual(m.diff(self.c,IP,1000,1120),200)
     def test_json_ipv4_ipv6_expires_and_private_filter(self):
         items=[]
-        for name,ip,count,expires in [('up4',IP,100,691190),('down4',IP,200,691195),('up6','2606:4700:4700::1111',300,None),('down4','127.0.0.1',400,691200)]:
+        for name,ip,count,expires in [('up4',IP,100,691190),('down4',IP,200,691195),('up6','2606:4700:4700::1111',300,None),('down4','127.0.0.1',400,691200),('down4','224.0.0.1',500,691200),('up4','100.64.1.1',600,691200)]:
             elem={'val':ip,'counter':{'bytes':count,'packets':1}}
             if expires is not None:elem['expires']=expires
             items.append({'set':{'name':name,'elem':[{'elem':elem}]}})
@@ -88,6 +94,9 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual(m.parse_duration('5m'), 300)
         self.assertEqual(m.parse_duration('2h'), 7200)
         self.assertEqual(m.parse_duration('1d'), 86400)
+        self.assertEqual(m.parse_duration('26s484ms'), 26)
+        self.assertEqual(m.parse_duration('1d2h3m4s500ms'), 86400+7200+180+4)
+        self.assertIsNone(m.parse_duration('500ms'))
         self.assertIsNone(m.parse_duration(None))
         self.assertIsNone(m.parse_duration(''))
         self.assertIsNone(m.parse_duration('garbage'))
@@ -113,6 +122,67 @@ class TrafficTests(unittest.TestCase):
         with patch.object(m.shutil,'which',return_value=None),patch.object(m,'run') as run:
             run.return_value.stdout='tcp 0 0 :::51911 :::* LISTEN 1194/xray\n'
             self.assertEqual(m.listening_ports(),[51911])
+    def _ports(self, output, proxy_only=True):
+        with patch.object(m.shutil,'which',return_value='/bin/ss'),patch.object(m,'run') as run:
+            run.return_value.stdout=output
+            return m.detect_ports(proxy_only)
+    def test_ignore_proxy_udp_client_sockets(self):
+        output='tcp LISTEN 0 4096 *:443 *:* users:(("xray",pid=1,fd=3))\nudp UNCONN 0 0 *:443 *:* users:(("xray",pid=1,fd=4))\nudp UNCONN 0 0 *:54321 *:* users:(("xray",pid=1,fd=8))\n'
+        self.assertEqual(self._ports(output), ([443], 'proxy'))
+    def test_hysteria_keeps_real_udp_port_only(self):
+        output='udp UNCONN 0 0 *:443 *:* users:(("hysteria",pid=1,fd=3))\nudp UNCONN 0 0 1.2.3.4:54321 *:* users:(("hysteria",pid=1,fd=7))\n'
+        self.assertEqual(self._ports(output), ([443], 'proxy'))
+    def test_hysteria_nat_high_port_kept(self):
+        output='udp UNCONN 0 0 *:45678 *:* users:(("hysteria",pid=1,fd=3))\n'
+        self.assertEqual(self._ports(output), ([45678], 'proxy'))
+    def test_public_proxy_port_wins_over_nginx(self):
+        output='\n'.join([
+            'tcp LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:* users:(("xray",pid=1,fd=3))',
+            'tcp LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=2,fd=5))',
+            'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=3,fd=3))',
+            'tcp LISTEN 0 4096 [::]:8443 [::]:* users:(("sing-box",pid=4,fd=3))',
+        ])+'\n'
+        self.assertEqual(self._ports(output), ([8443], 'proxy'))
+    def test_only_loopback_proxy_falls_through_to_frontend(self):
+        output='\n'.join([
+            'tcp LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:* users:(("xray",pid=1,fd=3))',
+            'tcp LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=2,fd=5))',
+            'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=3,fd=3))',
+        ])+'\n'
+        self.assertEqual(self._ports(output), ([443], 'frontend'))
+    def test_public_and_loopback_proxy_ports(self):
+        output='tcp LISTEN 0 4096 127.0.0.1:62789 0.0.0.0:* users:(("xray",pid=1,fd=6))\ntcp LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("xray",pid=1,fd=3))\n'
+        self.assertEqual(self._ports(output), ([443], 'proxy'))
+    def test_fallback_skips_ssh_ephemeral_udp_and_loopback(self):
+        output='\n'.join([
+            'tcp LISTEN 0 128 *:22 *:* users:(("sshd",pid=1,fd=3))',
+            'tcp LISTEN 0 511 *:80 *:* users:(("nginx",pid=2,fd=4))',
+            'udp UNCONN 0 0 *:54321 *:* users:(("python3",pid=3,fd=5))',
+            'udp UNCONN 0 0 *:68 *:* users:(("dhclient",pid=4,fd=6))',
+            'udp UNCONN 0 0 127.0.0.53:53 0.0.0.0:* users:(("systemd-resolve",pid=5,fd=8))',
+        ])+'\n'
+        self.assertEqual(self._ports(output, proxy_only=False), ([68, 80], 'fallback'))
+    def test_ss_without_H_is_retried(self):
+        def fake(args, **kwargs):
+            if '-H' in args:
+                raise m.subprocess.CalledProcessError(1, args)
+            class Result:
+                stdout='tcp LISTEN 0 4096 *:8443 *:* users:(("sing-box",pid=1,fd=3))\n'
+            return Result()
+        with patch.object(m.shutil,'which',return_value='/bin/ss'),patch.object(m,'run',side_effect=fake):
+            self.assertEqual(m.listening_ports(),[8443])
+    def test_report_says_root_when_data_dir_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            blocked = Path(temp)/'liuliang'
+            blocked.mkdir()
+            blocked.chmod(0)
+            try:
+                out=io.StringIO()
+                with patch.object(m,'DATA',blocked),contextlib.redirect_stdout(out):
+                    m.report({'ports':[443],'geo':True})
+                self.assertIn('root', out.getvalue())
+            finally:
+                blocked.chmod(0o700)
     def test_report_unicode(self):
         with tempfile.TemporaryDirectory() as temp:
             db=m.open_db(Path(temp)/'history-v1.db')

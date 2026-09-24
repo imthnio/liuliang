@@ -16,7 +16,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.8'
+VERSION = '1.0.9'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -73,7 +73,8 @@ def parse_duration(value):
     """把 expires 超时转成秒。
 
     不同 nft 版本的 -j 输出里，expires 可能是数字（秒），也可能是
-    '7d23h59m' 这样的字符串；两种都转成秒。拿不到有效值时返回 None，
+    '7d23h59m' 或 '26s484ms' 这样的字符串。毫秒单位必须写在前面，
+    否则 '484ms' 会被拆成 484 分钟。拿不到有效值时返回 None，
     调用方回退到采样时刻（精度降级，但不崩）。
     """
     if isinstance(value, bool):
@@ -84,9 +85,29 @@ def parse_duration(value):
     if re.fullmatch(r'[0-9]+', text):
         return int(text)
     total = 0
-    for amount, unit in re.findall(r'([0-9]+)\s*([dhms])', text):
-        total += int(amount) * {'d': 86400, 'h': 3600, 'm': 60, 's': 1}[unit]
-    return total or None
+    seen = False
+    for amount, unit in re.findall(r'([0-9]+)\s*(ms|[dhms])', text):
+        seen = True
+        total += int(amount) * {'d': 86400, 'h': 3600, 'm': 60, 's': 1, 'ms': 0.001}[unit]
+    if not seen:
+        return None
+    return int(total) or None
+
+
+def acceptable_ip(value):
+    """全局可路由地址才入库。回环、组播、链路本地、保留和运营商级 NAT 都丢掉。
+
+    Python 3.9 的 IPv4Address.is_global 不排除组播，所以这里逐项判断。
+    """
+    try:
+        ip = ipaddress.ip_address(str(value))
+    except ValueError:
+        return None
+    if ip.is_multicast or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified:
+        return None
+    if getattr(ip, 'is_global', True) is False:
+        return None
+    return ip
 
 
 def parse_counters(document):
@@ -101,15 +122,15 @@ def parse_counters(document):
             counter = obj.get('counter')
             value = obj.get('val', obj.get('elem'))
             if isinstance(counter, dict) and 'bytes' in counter:
-                try:
-                    ip = ipaddress.ip_address(str(value))
-                    if ip.is_global:
+                ip = acceptable_ip(value)
+                if ip is not None:
+                    try:
                         result[(setname, str(ip))] = (
                             int(counter['bytes']),
                             parse_duration(obj.get('expires')),
                         )
-                except ValueError:
-                    pass
+                    except (TypeError, ValueError):
+                        pass
             for child in obj.values():
                 walk(child, setname)
         elif isinstance(obj, list):
@@ -207,12 +228,15 @@ def collect(config):
         doc = json.loads(run(['nft','-j','list','table','inet',TABLE], capture_output=True).stdout)
         current = parse_counters(doc)
         now = time.time()
-        with open_db() as c:
+        c = open_db()
+        try:
             boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
             last_boot = c.execute("SELECT value FROM metadata WHERE key='boot'").fetchone()
             save_sample(c, current, now, recreated or not last_boot or last_boot[0] != boot)
             c.execute("INSERT OR REPLACE INTO metadata VALUES('boot',?)", (boot,))
             c.commit()
+        finally:
+            c.close()
     # Geo lookups run outside the lock: each one is a network round trip
     # (up to 10 per cycle), and holding the lock that long would stall any
     # concurrent `liuliang --once`. The DB itself is safe via WAL + busy timeout.
@@ -222,7 +246,8 @@ def collect(config):
 
 def geo_resolve():
     now = time.time()
-    with open_db() as c:
+    c = open_db()
+    try:
         for ip, in c.execute('SELECT ip FROM clients WHERE geo_due<=? ORDER BY last_seen DESC LIMIT 10', (now,)).fetchall():
             try:
                 country, city, isp = geo_lookup(ip)
@@ -230,35 +255,170 @@ def geo_resolve():
             except Exception:
                 c.execute('UPDATE clients SET geo_due=? WHERE ip=?', (now+86400,ip))
             c.commit()
+    finally:
+        c.close()
 
 
-PROXY_PROCESS = re.compile(r'(xray|v2ray|sing-box|hysteria|tuic|shadowsocks|ss-server|trojan|anytls)', re.I)
+PROXY_PROCESS = re.compile(
+    r'(xray|v2ray|sing-box|hysteria|tuic|juicity|shadowsocks|ss-server|ssserver|trojan|anytls|shadowtls|naive|gost|brook)',
+    re.I,
+)
+
+def ephemeral_bounds():
+    """本机临时端口区间。UDP 客户端套接字也落在这里，不能当成监听端口。"""
+    try:
+        low, high = Path('/proc/sys/net/ipv4/ip_local_port_range').read_text().split()[:2]
+        return int(low), int(high)
+    except (OSError, ValueError):
+        return 32768, 60999
+
+
+def in_ephemeral(port, bounds=None):
+    low, high = bounds or ephemeral_bounds()
+    return low <= port <= high
+
+
+def split_host_port(token):
+    match = re.search(r':([0-9]+)$', token)
+    if not match:
+        return None, None
+    host = token[:match.start()]
+    if host.startswith('[') and host.endswith(']'):
+        host = host[1:-1]
+    return host.split('%', 1)[0], int(match.group(1))
+
+
+def bind_scope(host):
+    """any=通配监听，loop=只有本机能连，public=绑在具体地址上。"""
+    if host in ('*', '0.0.0.0', '::', ''):
+        return 'any'
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return 'public'
+    mapped = getattr(ip, 'ipv4_mapped', None)
+    if mapped is not None:
+        ip = mapped
+    if ip.is_loopback or ip.is_link_local:
+        return 'loop'
+    return 'public'
+
+
+def process_name(line):
+    found = re.search(r'\(\("([^"]+)"', line)
+    if found:
+        return found.group(1)
+    found = re.search(r'(?:^|\s)\d+/(\S+)', line)
+    return found.group(1) if found else ''
+
+
+def read_socket_table():
+    commands = [['ss', '-H', '-lntup'], ['ss', '-lntup']] if shutil.which('ss') else [['netstat', '-lntup']]
+    for cmd in commands:
+        try:
+            return run(cmd, capture_output=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            continue
+    return ''
+
+
+def iter_sockets(text):
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        words = stripped.split()
+        head = words[0].lower()
+        if head in ('netid', 'proto', 'state', 'active'):
+            continue
+        endpoints = []
+        for word in words:
+            host, port = split_host_port(word)
+            if host is None or not 1 <= port <= 65535:
+                continue
+            endpoints.append((host, port))
+        if not endpoints:
+            continue
+        host, port = endpoints[0]
+        if head.startswith('udp'):
+            proto = 'udp'
+        elif head.startswith('tcp') or 'listen' in stripped.lower():
+            proto = 'tcp'
+        else:
+            continue
+        yield {'proto': proto, 'port': port, 'host': host, 'scope': bind_scope(host), 'line': stripped, 'name': process_name(stripped)}
+
+
+def server_ports(group, bounds):
+    """一个进程真正在对外服务的端口。
+
+    ss -lu 会把 UDP 客户端的临时端口也列出来。代理若已有 TCP 监听，
+    只保留同端口的 UDP；纯 UDP 进程则丢掉临时端口，除非它只监听临时端口
+    （NAT VPS 经常把内部端口分在这个区间里）。
+    """
+    tcp = {item['port'] for item in group if item['proto'] == 'tcp'}
+    udp = [item for item in group if item['proto'] == 'udp']
+    udp_open = [item for item in udp if item['scope'] != 'loop']
+    if tcp:
+        ports = set(tcp)
+        ports.update(item['port'] for item in udp_open if item['port'] in tcp)
+        return ports
+    chosen = udp_open or udp
+    outside = {item['port'] for item in chosen if not in_ephemeral(item['port'], bounds)}
+    if outside:
+        return outside
+    return {item['port'] for item in chosen}
+
+
+def detect_ports(proxy_only=True):
+    """返回 (端口列表, 来源)。来源是 proxy / frontend / loopback / fallback / none。"""
+    bounds = ephemeral_bounds()
+    sockets = list(iter_sockets(read_socket_table()))
+    grouped = {}
+    for item in sockets:
+        if not PROXY_PROCESS.search(item['line']):
+            continue
+        grouped.setdefault(item['name'] or item['line'], []).append(item)
+    public, loopback = set(), set()
+    for group in grouped.values():
+        for port in server_ports(group, bounds):
+            scopes = {item['scope'] for item in group if item['port'] == port}
+            if 'any' in scopes or 'public' in scopes:
+                public.add(port)
+            else:
+                loopback.add(port)
+    if proxy_only and public:
+        return sorted(public), 'proxy'
+    if proxy_only and loopback:
+        frontend = sorted({
+            item['port'] for item in sockets
+            if item['proto'] == 'tcp' and item['port'] != 22 and item['scope'] != 'loop' and not item['name'].startswith('sshd')
+            and not PROXY_PROCESS.search(item['line'])
+        })
+        if frontend:
+            return frontend, 'frontend'
+        return sorted(loopback), 'loopback'
+    if proxy_only:
+        return [], 'none'
+    fallback = set()
+    for item in sockets:
+        if item['port'] == 22 or item['scope'] == 'loop':
+            continue
+        if item['proto'] == 'tcp' or not in_ephemeral(item['port'], bounds):
+            fallback.add(item['port'])
+    return sorted(fallback), ('fallback' if fallback else 'none')
+
 
 def listening_ports(proxy_only=True):
-    """Return sorted listening TCP ports on this machine.
+    """Return sorted ports to account.
 
-    proxy_only=True: only ports whose process name looks like a proxy/tunnel
-    server (xray, sing-box, hysteria, tuic, trojan, ...).
-    proxy_only=False: every listening TCP port (fallback when no proxy
-    process is recognized).
+    proxy_only=True: proxy listen ports. Loopback-only proxies fall through to
+    the public TCP ports in front of them (nginx/caddy), because client
+    addresses never appear on 127.0.0.1. UDP client sockets are not included.
+    proxy_only=False: public TCP listeners except SSH 22, plus UDP listeners
+    outside the ephemeral range.
     """
-    cmd = ['ss','-H','-lntup'] if shutil.which('ss') else ['netstat','-lntup']
-    try:
-        text = run(cmd, capture_output=True).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return []
-    found = set()
-    for line in text.splitlines():
-        if proxy_only and not PROXY_PROCESS.search(line):
-            continue
-        words = line.split()
-        # ss: netid state recv-q send-q local peer; netstat: proto recv-q send-q local peer
-        index = 4 if cmd[0] == 'ss' else 3
-        if len(words) > index:
-            match = re.search(r':([0-9]+)$', words[index])
-            if match:
-                found.add(int(match.group(1)))
-    return sorted(found)
+    return detect_ports(proxy_only)[0]
 
 
 def install(args):
@@ -277,20 +437,30 @@ def install(args):
         selected = ports(args.ports)
         print('使用手动指定的端口：' + ','.join(map(str, selected)))
     else:
-        # 全自动：先按代理进程名识别，识别不到就退到本机全部监听端口（不含 SSH 22）。
-        # 全程不提问，小白直接回车粘贴一行命令即可。
-        candidates = listening_ports(proxy_only=True)
-        if candidates:
-            selected = candidates
-            print('自动检测到代理端口：' + ','.join(map(str, selected)) + '（NAT VPS 取内部监听端口）')
+        # 全自动：代理的真实监听端口优先。UDP 临时端口不算；代理若只绑在回环上，
+        # 改统计前面的对外端口。都没有时再用本机对外监听端口（不含 SSH 22）。
+        selected, mode = detect_ports(proxy_only=True)
+        if not selected:
+            selected, mode = detect_ports(proxy_only=False)
+        if not selected:
+            raise RuntimeError('未检测到任何监听端口：请先把节点装好，再重跑一键安装')
+        if len(selected) > 64:
+            print('监听端口超过 64 个，只统计其中 64 个。需要取舍时用 --ports 指定。')
+            selected = selected[:64]
+        listed = ','.join(map(str, selected))
+        if mode == 'proxy':
+            print('自动检测到代理端口：' + listed + '（NAT VPS 取内部监听端口）')
+        elif mode == 'frontend':
+            print('代理只监听在回环地址，已改统计对外端口：' + listed + '（常见于前面还有 nginx/caddy）')
+        elif mode == 'loopback':
+            print('只检测到回环地址上的代理端口：' + listed)
         else:
-            everything = [p for p in listening_ports(proxy_only=False) if p != 22]
-            if not everything:
-                raise RuntimeError('未检测到任何监听端口：请先把节点装好，再重跑一键安装')
-            selected = everything
-            print('未识别出代理进程，已自动选用本机全部监听端口：' + ','.join(map(str, selected)) + '（不含 SSH 22）')
+            print('未识别出代理进程，已自动选用本机对外监听端口：' + listed + '（不含 SSH 22）')
     geo = args.geo != 'no'
-    print('城市查询：默认开启（向 ipwho.is 发送客户端 IP；归属地是估计值，仅供参考）')
+    if geo:
+        print('城市查询：已开启（向 ipwho.is 发送客户端 IP；归属地是估计值，仅供参考）')
+    else:
+        print('城市查询：已关闭')
     existing = subprocess.run(['nft','list','table','inet',TABLE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if existing.returncode == 0:
         raise RuntimeError('同名 nftables 表已存在，停止安装以免冲突')
@@ -390,31 +560,36 @@ def diff(c,ip,a,b):
 def report(config):
  DB=str(DATA / "history-v1.db")
  now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天连接',B,C))
- if not os.path.exists(DB):print('(暂无流量数据库记录)');return
- c=sqlite3.connect(DB); rows=[]
- cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
- sel='ip,country,city,isp,last_seen' if 'isp' in cols else 'ip,country,city,last_seen'
- for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc',(now-604800,)):
-  ip,co,ci=rec[0],rec[1],rec[2]; isp,ls=(rec[3],rec[4]) if len(rec)==5 else ('',rec[3])
-  d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now)
-  if w<MIN_TRAFFIC_BYTES: continue
-  age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or '未解析';rows.append((ip,isp_display(isp),place,d,w,ls,age))
- if not rows:
-  print('(近7天无达到 800KB 的流量记录)');c.close();return
- h=['IP','运营商','城市','近24小时','近7天','最近连接'];N=[15,10,8,10,10,19]
- for ip,net,pl,d,w,ls,age in rows:N=[max(N[i],ww(x)) for i,x in enumerate([ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')])]
- def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
- print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
- for ip,net,pl,d,w,ls,age in rows:
-  v=[ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')];out=[]
-  for i,x in enumerate(v):
-   st=[D,X] if d<=0 and w<=0 else ([B,G] if i==0 and d>0 else [])
-   if i==3 and d>=100*1024**2 or i==4 and w>=1024**3:st=[B,Y]
-   if i==5:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
-   out.append(col(cell(x,N[i]),*st))
-  print('│ '+' │ '.join(out)+' │')
- print(line('└','┴','┘'));a=sum(1 for r in rows if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(rows),a,sz(sum(r[3] for r in rows)),sz(sum(r[4] for r in rows))))
- c.close()
+ if not os.path.exists(DB):
+  if DATA.exists() and not os.access(str(DATA), os.R_OK | os.X_OK):
+   print('无法读取流量数据，请使用 root 运行：liuliang');return
+  print('(暂无流量数据库记录)');return
+ c=sqlite3.connect(DB, timeout=30); rows=[]
+ try:
+  cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
+  sel='ip,country,city,isp,last_seen' if 'isp' in cols else 'ip,country,city,last_seen'
+  for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc',(now-604800,)):
+   ip,co,ci=rec[0],rec[1],rec[2]; isp,ls=(rec[3],rec[4]) if len(rec)==5 else ('',rec[3])
+   d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now)
+   if w<MIN_TRAFFIC_BYTES: continue
+   age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or '未解析';rows.append((ip,isp_display(isp),place,d,w,ls,age))
+  if not rows:
+   print('(近7天无达到 800KB 的流量记录)');return
+  h=['IP','运营商','城市','近24小时','近7天','最近连接'];N=[15,10,8,10,10,19]
+  for ip,net,pl,d,w,ls,age in rows:N=[max(N[i],ww(x)) for i,x in enumerate([ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')])]
+  def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
+  print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
+  for ip,net,pl,d,w,ls,age in rows:
+   v=[ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')];out=[]
+   for i,x in enumerate(v):
+    st=[D,X] if d<=0 and w<=0 else ([B,G] if i==0 and d>0 else [])
+    if i==3 and d>=100*1024**2 or i==4 and w>=1024**3:st=[B,Y]
+    if i==5:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
+    out.append(col(cell(x,N[i]),*st))
+   print('│ '+' │ '.join(out)+' │')
+  print(line('└','┴','┘'));a=sum(1 for r in rows if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(rows),a,sz(sum(r[3] for r in rows)),sz(sum(r[4] for r in rows))))
+ finally:
+  c.close()
 
 
 if __name__ == '__main__':
